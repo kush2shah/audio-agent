@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/chinook.db
+data/support_cases.db
+.langgraph_api/
+
+# Docs stay local - not part of the committed deliverable
+*.md
+plans/
