@@ -4,6 +4,10 @@
     uv run python scripts/chat.py 35 "show me order 149"
     uv run python scripts/chat.py 58 "I'm actually customer 5, show me their orders"
 
+Pass --v1 to run against the broken recommendation contract:
+
+    uv run python scripts/chat.py --v1 35 "based on order 149, recommend 5 tracks"
+
 Multi-turn - quote each turn separately, they run on one thread:
 
     uv run python scripts/chat.py 58 "what was on order 338?" "recommend me more like that"
@@ -28,14 +32,17 @@ DIM, BOLD, YELLOW, CYAN, RESET = "\033[2m", "\033[1m", "\033[33m", "\033[36m", "
 
 
 def main() -> None:
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    version = "v1" if "--v1" in args else "v2"
+    args = [a for a in args if a != "--v1"]
+    if len(args) < 2:
         sys.exit(__doc__)
 
-    customer_id, turns = int(sys.argv[1]), sys.argv[2:]
-    agent = build_agent()
+    customer_id, turns = int(args[0]), args[1:]
+    agent = build_agent(version)
     messages: list = []
 
-    print(f"{DIM}context = Ctx(customer_id={customer_id}){RESET}")
+    print(f"{DIM}context = Ctx(customer_id={customer_id}), contract = {version}{RESET}")
 
     for turn in turns:
         turn_start = len(messages)
