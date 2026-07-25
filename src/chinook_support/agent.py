@@ -16,6 +16,7 @@ import os
 from langchain.agents import create_agent
 
 from .context import Ctx
+from .middleware import handoff_to_human, receipts
 from .tools.account import get_my_invoice, list_my_invoices
 from .tools.catalog import make_recommend_tracks, search_catalog
 
@@ -50,7 +51,7 @@ def build_agent(contract_version: str = "v2"):
     no restart is needed mid-demo, and an experiment can't accidentally pick up
     the wrong one.
     """
-    return create_agent(
+    agent = create_agent(
         model=MODEL,
         tools=[
             list_my_invoices,
@@ -60,7 +61,14 @@ def build_agent(contract_version: str = "v2"):
         ],
         system_prompt=SYSTEM_PROMPT,
         context_schema=Ctx,
+        # handoff_to_human can end the turn; receipts only observes. Both run
+        # after the model, so both see the completed tool results for the turn.
+        middleware=[handoff_to_human, receipts],
     )
+    # Stamped on the root run at invoke time, so `contract_version` is filterable
+    # across whole traces - which is how you find every v1 run in production
+    # after you learn v1 was wrong.
+    return agent.with_config(metadata={"contract_version": contract_version})
 
 
 graph_v1 = build_agent("v1")  # ships the recommendation bug, kept for the demo

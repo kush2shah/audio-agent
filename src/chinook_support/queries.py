@@ -83,6 +83,25 @@ def owned_track_ids(customer_id: int) -> set[int]:
     return {r["track_id"] for r in rows}
 
 
+def support_rep_for(customer_id: int) -> dict | None:
+    """The employee already assigned to this customer in Chinook.
+
+    Every customer has one. A handoff goes to *their* rep, not a generic queue -
+    which is the difference between "someone will get back to you" and "Jane, who
+    has handled your account since 2021, will."
+    """
+    return query_one(
+        """SELECT e.EmployeeId AS rep_id,
+                  e.FirstName || ' ' || e.LastName AS rep_name,
+                  e.Title AS rep_title,
+                  e.Email AS rep_email
+           FROM Customer c
+           JOIN Employee e ON e.EmployeeId = c.SupportRepId
+           WHERE c.CustomerId = ?""",
+        (customer_id,),
+    )
+
+
 # --- Catalog ---------------------------------------------------------------
 
 # Shared by search and recommendations so every catalog row has the same shape.

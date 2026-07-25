@@ -1,0 +1,185 @@
+"""Middleware - the things that wrap every turn, regardless of which tool ran.
+
+Two here, doing very different jobs:
+
+`handoff_to_human` is product behavior. A support bot that cannot recognize it is
+failing is worse than no bot, because it traps the customer. This is the feature
+a real store could not ship without.
+
+`receipts` is observability. It lifts what the tools actually enforced onto the
+run itself, so LangSmith can be queried by business rule rather than only by
+latency and tokens.
+"""
+
+import json
+from typing import Any
+
+from langchain.agents.middleware import AgentState, after_model, hook_config
+from langchain.messages import AIMessage
+from langgraph.runtime import Runtime
+from langsmith import get_current_run_tree
+
+from . import queries
+from .context import Ctx
+
+# A tool saying "I have nothing for you" is not an error - it is a normal answer.
+# But several in a row means the customer is asking for something this agent
+# structurally cannot do, and continuing to try wastes their time.
+DEAD_END_STATUSES = {"not_available", "no_match", "error"}
+CONSECUTIVE_DEAD_ENDS_BEFORE_HANDOFF = 3
+
+# Deliberately literal. Inferring frustration from tone would be unreliable and
+# unexplainable; a customer asking for a person is unambiguous.
+HUMAN_REQUESTED = (
+    "speak to a human",
+    "talk to a human",
+    "speak to a person",
+    "talk to a person",
+    "real person",
+    "speak to someone",
+    "talk to someone",
+    "customer service",
+    "a representative",
+    "your manager",
+    "escalate",
+)
+
+
+def _root_run():
+    """The trace's root run, walking up from wherever we're called.
+
+    `get_current_run_tree()` inside a middleware hook returns that hook's own
+    span (`receipts.after_model`). Metadata written there is real but useless -
+    LangSmith's run filters match against root runs, so a receipt on a nested
+    span can't be queried. Walk to the top.
+    """
+    run = get_current_run_tree()
+    while run is not None and getattr(run, "parent_run", None) is not None:
+        run = run.parent_run
+    return run
+
+
+def _tool_payloads(state: AgentState) -> list[dict]:
+    """Every tool result in the conversation, oldest first."""
+    payloads = []
+    for message in state["messages"]:
+        if getattr(message, "type", None) != "tool":
+            continue
+        try:
+            payloads.append(json.loads(message.content))
+        except (json.JSONDecodeError, TypeError):
+            payloads.append({"status": "error"})
+    return payloads
+
+
+def _consecutive_dead_ends(payloads: list[dict]) -> int:
+    count = 0
+    for payload in reversed(payloads):
+        if payload.get("status") in DEAD_END_STATUSES:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _asked_for_a_human(state: AgentState) -> bool:
+    for message in reversed(state["messages"]):
+        if getattr(message, "type", None) == "human":
+            text = str(message.content).lower()
+            return any(phrase in text for phrase in HUMAN_REQUESTED)
+    return False
+
+
+@after_model
+@hook_config(can_jump_to=["end"])
+def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
+    """Stop the loop and route to the customer's own support rep.
+
+    Fires when the customer asks for a person, or when the agent has hit several
+    dead ends in a row and is clearly not converging.
+
+    This is the middleware a real store could not ship without. An agent that
+    keeps cheerfully trying is not being helpful - it is holding the customer
+    hostage to its own limitations.
+    """
+    payloads = _tool_payloads(state)
+    dead_ends = _consecutive_dead_ends(payloads)
+    explicit = _asked_for_a_human(state)
+
+    if not explicit and dead_ends < CONSECUTIVE_DEAD_ENDS_BEFORE_HANDOFF:
+        return None
+
+    rep = queries.support_rep_for(runtime.context.customer_id)
+    reason = "customer_requested" if explicit else "repeated_dead_ends"
+
+    if run := _root_run():
+        run.add_metadata({"handoff": True, "handoff_reason": reason})
+
+    if rep is None:  # no rep on file - still stop, don't keep looping
+        return {
+            "messages": [
+                AIMessage(
+                    "I'm not able to sort this out here, so I'm passing you to our "
+                    "support team - someone will follow up with you directly."
+                )
+            ],
+            "jump_to": "end",
+        }
+
+    lead = (
+        "Of course"
+        if explicit
+        else "I'm not finding what you need, and I don't want to keep you going in circles"
+    )
+    return {
+        "messages": [
+            AIMessage(
+                f"{lead} - I'm handing this to {rep['rep_name']}, "
+                f"{rep['rep_title'].lower()} for your account. You can reach them at "
+                f"{rep['rep_email']}, and they'll have this conversation in front of them."
+            )
+        ],
+        "jump_to": "end",
+    }
+
+
+@after_model
+def receipts(state: AgentState, runtime: Runtime[Ctx]) -> None:
+    """Stamp what the tools actually enforced onto the LangSmith run.
+
+    Every tool returns `constraints_applied` describing the guarantees it applied.
+    This lifts those onto the run as flat, top-level metadata keys.
+
+    Flat and scalar on purpose: LangSmith's filter grammar matches key/value pairs
+    (`eq(metadata_key, "excluded_previously_purchased")`) and has no nested-path
+    syntax, so a nested dict would not be queryable at all.
+
+    What that buys - questions you can now ask of production traffic:
+
+        every run where the owned-track filter did not apply
+        every run where a tool refused because a record wasn't on the account
+
+    Same field the evaluators assert against, so "did the filter run?" is one
+    fact with three consumers: model-readable, human-filterable, machine-assertable.
+    """
+    run = _root_run()
+    if run is None:
+        return None
+
+    payloads = _tool_payloads(state)
+    receipt: dict[str, Any] = {}
+    statuses = []
+    for payload in payloads:
+        statuses.append(payload.get("status", "unknown"))
+        for key, value in (payload.get("constraints_applied") or {}).items():
+            # Everything is stringified. LangSmith's metadata filter compares
+            # values as strings, so a Python bool stored as `True` will never
+            # match eq(metadata_value, "true") - it silently returns nothing,
+            # which is the worst kind of broken for a filter.
+            receipt[key] = "null" if value is None else str(value).lower()
+
+    if statuses:
+        receipt["tool_statuses"] = ",".join(statuses)
+        receipt["dead_end_streak"] = str(_consecutive_dead_ends(payloads))
+    run.add_metadata(receipt)
+    return None
