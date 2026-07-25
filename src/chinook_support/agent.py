@@ -17,14 +17,16 @@ from langchain.agents import create_agent
 
 from .context import Ctx
 from .tools.account import get_my_invoice, list_my_invoices
+from .tools.catalog import make_recommend_tracks, search_catalog
 
 MODEL = os.getenv("CHINOOK_MODEL", "anthropic:claude-sonnet-4-6")
 
 SYSTEM_PROMPT = """You are the customer support assistant for Chinook Records, an \
 online music store.
 
-You can look up the signed-in customer's order history and the contents of their \
-individual orders.
+You can look up the signed-in customer's order history, the contents of their \
+individual orders, search the catalog, and recommend music based on what they've \
+bought before.
 
 Rules:
 - Every factual claim about orders or the catalog must come from a tool result. \
@@ -39,13 +41,28 @@ speculate about why, and do not confirm or deny that the record exists.
 - Be warm and concise. You're a record store, not a bank."""
 
 
-def build_agent():
+def build_agent(contract_version: str = "v2"):
+    """Build the agent against one version of the recommendation contract.
+
+    v1 and v2 differ only in the SQL behind `recommend_tracks`. Same model, same
+    prompt, same tool names and signatures. Exporting both as separate graphs
+    beats flipping an environment variable: Studio can show them side by side,
+    no restart is needed mid-demo, and an experiment can't accidentally pick up
+    the wrong one.
+    """
     return create_agent(
         model=MODEL,
-        tools=[list_my_invoices, get_my_invoice],
+        tools=[
+            list_my_invoices,
+            get_my_invoice,
+            search_catalog,
+            make_recommend_tracks(exclude_owned=contract_version == "v2"),
+        ],
         system_prompt=SYSTEM_PROMPT,
         context_schema=Ctx,
     )
 
 
-graph = build_agent()
+graph_v1 = build_agent("v1")  # ships the recommendation bug, kept for the demo
+graph_v2 = build_agent("v2")  # the fix
+graph = graph_v2
