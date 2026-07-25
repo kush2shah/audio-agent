@@ -51,13 +51,25 @@ def test_three_dead_ends_reaches_the_handoff_threshold():
 @pytest.mark.parametrize(
     "text,expected",
     [
+        # The phrasing that caught the first version out: it had "speak to" but
+        # not "speak with", and no "agent" at all. The natural phrasing is
+        # always the one you didn't write down.
+        ("can i speak with an agent", True),
         ("I want to speak to a human", True),
         ("can I talk to someone please", True),
+        ("connect me to someone", True),
+        ("transfer me to a human", True),
+        ("put me through to customer service", True),
         ("get me a representative", True),
+        ("let me talk with your manager", True),
+        ("I need a real person", True),
         ("escalate this", True),
+        # Must NOT fire - these are ordinary requests that share vocabulary.
         ("what did I buy?", False),
         ("recommend me something", False),
-        # A track called "Human" must not trigger a handoff.
+        ("get me 5 jazz tracks", False),
+        ("can you get me my order history", False),
+        # A band called "Human League" must not trigger a handoff.
         ("do you have any songs by Human League?", False),
     ],
 )

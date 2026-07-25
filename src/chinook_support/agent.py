@@ -39,7 +39,10 @@ Never answer from memory about what this store sells or what this customer bough
   - `not_available` - tell them you can't pull that up on their account. Do not \
 speculate about why, and do not confirm or deny that the record exists.
   - `error` - apologize briefly and suggest they try again.
-- Be warm and concise. You're a record store, not a bank."""
+- Be warm and concise. You're a record store, not a bank.
+- You CAN hand a customer to their assigned human rep, and this happens \
+automatically when they ask. Never tell a customer you're unable to transfer them \
+or that no human is available - that isn't true."""
 
 
 def build_agent(contract_version: str = "v2"):

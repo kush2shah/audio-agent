@@ -12,6 +12,7 @@ latency and tokens.
 """
 
 import json
+import re
 from typing import Any
 
 from langchain.agents.middleware import AgentState, after_model, hook_config
@@ -28,20 +29,26 @@ from .context import Ctx
 DEAD_END_STATUSES = {"not_available", "no_match", "error"}
 CONSECUTIVE_DEAD_ENDS_BEFORE_HANDOFF = 3
 
-# Deliberately literal. Inferring frustration from tone would be unreliable and
-# unexplainable; a customer asking for a person is unambiguous.
-HUMAN_REQUESTED = (
-    "speak to a human",
-    "talk to a human",
-    "speak to a person",
-    "talk to a person",
-    "real person",
-    "speak to someone",
-    "talk to someone",
-    "customer service",
-    "a representative",
-    "your manager",
-    "escalate",
+# Matching a customer's request for a person. Deliberately pattern-based rather
+# than sentiment-based: "are they frustrated" is a judgement call, "did they ask
+# for a human" is a fact.
+#
+# The first version of this was a list of literal phrases and it missed
+# "can I speak with an agent" - it had "speak to" but not "speak with", and no
+# "agent" at all. Worth remembering that the natural phrasing is the one you
+# didn't write down.
+HUMAN_REQUESTED = re.compile(
+    r"""
+    (speak|talk|chat|connect|transfer|put|get)               # the ask
+    \s+(me|us)?\s*(to|with|through)?\s*(a|an|the)?\s*        # optional glue
+    (human|person|agent|someone|somebody|rep\b|representative|advisor|staff)
+    | real\s+(person|human)
+    | customer\s+service
+    | (your|a)\s+(manager|supervisor)
+    | escalate
+    | human\s+support
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -85,8 +92,7 @@ def _consecutive_dead_ends(payloads: list[dict]) -> int:
 def _asked_for_a_human(state: AgentState) -> bool:
     for message in reversed(state["messages"]):
         if getattr(message, "type", None) == "human":
-            text = str(message.content).lower()
-            return any(phrase in text for phrase in HUMAN_REQUESTED)
+            return bool(HUMAN_REQUESTED.search(str(message.content)))
     return False
 
 
