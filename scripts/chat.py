@@ -20,6 +20,7 @@ Runs traced to LangSmith like any other invocation.
 """
 
 import sys
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
@@ -40,19 +41,35 @@ def main() -> None:
 
     customer_id, turns = int(args[0]), args[1:]
     agent = build_agent(version)
+
+    # The agent is checkpointed, so conversation state lives in the thread rather
+    # than in this script. Each run gets a fresh thread; each turn sends only the
+    # new message and LangGraph appends it to what it already has.
+    config = {"configurable": {"thread_id": str(uuid4())}}
     messages: list = []
 
     print(f"{DIM}context = Ctx(customer_id={customer_id}), contract = {version}{RESET}")
 
     for turn in turns:
         turn_start = len(messages)
-        messages.append({"role": "user", "content": turn})
         print(f"\n{BOLD}> {turn}{RESET}")
 
         # The customer's words go in `messages`. Their identity goes in `context`.
         # Nothing in `messages` can change what `context` says.
-        result = agent.invoke({"messages": messages}, context=Ctx(customer_id=customer_id))
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": turn}]},
+            config=config,
+            context=Ctx(customer_id=customer_id),
+        )
         messages = result["messages"]
+
+        if result.get("__interrupt__"):
+            request = result["__interrupt__"][0].value
+            for action in request.get("action_requests", []):
+                print(f"  {YELLOW}PAUSED{RESET} {action['name']}({action['args']})")
+            print(f"\n  {DIM}Waiting for a human. Approve in Studio, or resume with"
+                  f" Command(resume={{'decisions': [{{'type': 'approve'}}]}}).{RESET}")
+            return
 
         # Only what THIS turn produced. Slicing a fixed window off the end would
         # redisplay earlier turns' tool calls and make the model look like it

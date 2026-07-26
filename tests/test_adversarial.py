@@ -56,6 +56,9 @@ def their_invoice_ids():
 def test_attack_cannot_reach_another_customers_data(agent, their_invoice_ids, name, prompt):
     result = agent.invoke(
         {"messages": [{"role": "user", "content": prompt}]},
+        # The agent is checkpointed (interrupts need somewhere to wait), so every
+        # invocation needs a thread. One per attack keeps them independent.
+        config={"configurable": {"thread_id": f"attack-{name}"}},
         context=Ctx(customer_id=CUSTOMER),
     )
 

@@ -14,11 +14,14 @@ governs tone and how to talk about tool results.
 import os
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
 
 from .context import Ctx
 from .middleware import handoff_to_human, receipts
 from .tools.account import get_my_invoice, list_my_invoices
 from .tools.catalog import make_recommend_tracks, search_catalog
+from .tools.support import escalate_to_human
 
 MODEL = os.getenv("CHINOOK_MODEL", "anthropic:claude-sonnet-4-6")
 
@@ -42,7 +45,10 @@ speculate about why, and do not confirm or deny that the record exists.
 - Be warm and concise. You're a record store, not a bank.
 - You CAN hand a customer to their assigned human rep, and this happens \
 automatically when they ask. Never tell a customer you're unable to transfer them \
-or that no human is available - that isn't true."""
+or that no human is available - that isn't true.
+- Call `escalate_to_human` when someone seems frustrated, when you've tried the \
+same thing twice without success, or when they need something you have no tool \
+for. Opening a case is a normal, good outcome - not a failure."""
 
 
 def build_agent(contract_version: str = "v2"):
@@ -61,12 +67,28 @@ def build_agent(contract_version: str = "v2"):
             get_my_invoice,
             search_catalog,
             make_recommend_tracks(exclude_owned=contract_version == "v2"),
+            escalate_to_human,
         ],
         system_prompt=SYSTEM_PROMPT,
         context_schema=Ctx,
-        # handoff_to_human can end the turn; receipts only observes. Both run
-        # after the model, so both see the completed tool results for the turn.
-        middleware=[handoff_to_human, receipts],
+        middleware=[
+            # Reads are safe and run unattended. The one tool that writes pauses
+            # for a person. Not "the model is untrustworthy" - it's that writes
+            # are where mistakes become other people's problems.
+            HumanInTheLoopMiddleware(
+                interrupt_on={
+                    "escalate_to_human": {"allowed_decisions": ["approve", "reject"]},
+                },
+                description_prefix="Opening a support case - needs approval",
+            ),
+            # handoff_to_human can end the turn; receipts only observes. Both run
+            # after the model, so both see the completed tool results for the turn.
+            handoff_to_human,
+            receipts,
+        ],
+        # Interrupts need somewhere to keep the conversation while it waits.
+        # InMemorySaver is fine for a demo; production wants Postgres.
+        checkpointer=InMemorySaver(),
     )
     # Stamped on the root run at invoke time, so `contract_version` is filterable
     # across whole traces - which is how you find every v1 run in production
