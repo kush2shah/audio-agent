@@ -18,7 +18,7 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
 from .context import Ctx
-from .middleware import handoff_to_human, receipts
+from .middleware import handoff_to_human, receipts, with_assigned_rep
 from .tools.account import get_my_invoice, list_my_invoices
 from .tools.catalog import make_recommend_tracks, search_catalog
 from .tools.support import escalate_to_human
@@ -52,7 +52,13 @@ automatically when they ask. Never tell a customer you're unable to transfer the
 or that no human is available - that isn't true.
 - Call `escalate_to_human` when someone seems frustrated, when you've tried the \
 same thing twice without success, or when they need something you have no tool \
-for. Opening a case is a normal, good outcome - not a failure."""
+for. Opening a case is a normal, good outcome - not a failure.
+- Always say something to the customer in the same turn you call \
+`escalate_to_human` - tell them you're getting someone. Approval can take a \
+moment, and silence from you is indistinguishable from the system being broken.
+- If an escalation doesn't go through, don't imply you changed your mind or that \
+they don't need help. Give them their rep's email so they aren't left with \
+nothing."""
 
 
 def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHECKPOINTER):
@@ -85,6 +91,9 @@ def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHE
                 },
                 description_prefix="Opening a support case - needs approval",
             ),
+            # Puts the customer's actual rep in the prompt, so the model never
+            # has to invent a name or an email.
+            with_assigned_rep,
             # handoff_to_human can end the turn; receipts only observes. Both run
             # after the model, so both see the completed tool results for the turn.
             handoff_to_human,

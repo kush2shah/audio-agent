@@ -15,12 +15,18 @@ import json
 import re
 from typing import Any
 
-from langchain.agents.middleware import AgentState, after_model, hook_config
+from langchain.agents.middleware import (
+    AgentState,
+    ModelRequest,
+    after_model,
+    dynamic_prompt,
+    hook_config,
+)
 from langchain.messages import AIMessage
 from langgraph.runtime import Runtime
 from langsmith import get_current_run_tree
 
-from . import queries
+from . import cases, queries
 from .context import Ctx
 
 # A tool saying "I have nothing for you" is not an error - it is a normal answer.
@@ -96,6 +102,33 @@ def _asked_for_a_human(state: AgentState) -> bool:
     return False
 
 
+def prompt_with_rep(base: str, customer_id: int) -> str:
+    """Append this customer's real rep details to the system prompt.
+
+    Added after the model invented a support email address. The prompt told it to
+    give out the rep's contact details, but nothing ever put those details in
+    context - on the rejected-escalation path the escalation tool never runs - so
+    it produced a plausible-looking address that doesn't exist.
+
+    The instruction wasn't wrong, it was unsupported. A model asked for a fact it
+    doesn't have will supply something shaped like that fact. Rewording the
+    instruction would have produced a differently-worded invention.
+    """
+    rep = queries.support_rep_for(customer_id)
+    if rep is None:
+        return base
+    return (
+        f"{base}\n\nThis customer's assigned rep is {rep['rep_name']} "
+        f"({rep['rep_title']}), {rep['rep_email']}. Use these exact details when "
+        f"referring to their rep - never guess a name or an address."
+    )
+
+
+@dynamic_prompt
+def with_assigned_rep(request: ModelRequest) -> str:
+    return prompt_with_rep(request.system_prompt or "", request.runtime.context.customer_id)
+
+
 @after_model
 @hook_config(can_jump_to=["end"])
 def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
@@ -115,7 +148,8 @@ def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any]
     if not explicit and dead_ends < CONSECUTIVE_DEAD_ENDS_BEFORE_HANDOFF:
         return None
 
-    rep = queries.support_rep_for(runtime.context.customer_id)
+    customer_id = runtime.context.customer_id
+    rep = queries.support_rep_for(customer_id)
     reason = "customer_requested" if explicit else "repeated_dead_ends"
 
     if run := _root_run():
@@ -132,21 +166,34 @@ def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any]
             "jump_to": "end",
         }
 
-    lead = (
-        "Of course"
-        if explicit
-        else "I'm not finding what you need, and I don't want to keep you going in circles"
-    )
-    return {
-        "messages": [
-            AIMessage(
-                f"{lead} - I'm handing this to {rep['rep_name']}, "
-                f"{rep['rep_title'].lower()} for your account. You can reach them at "
-                f"{rep['rep_email']}, and they'll have this conversation in front of them."
-            )
-        ],
-        "jump_to": "end",
-    }
+    # Open the case here rather than promising one. An earlier version told the
+    # customer "they'll have this conversation in front of them" and wrote
+    # nothing - a warm, specific, completely false promise.
+    #
+    # This write is not gated by human approval, unlike escalate_to_human, and
+    # the distinction is the point: approval is required when the *model*
+    # decides to escalate, not when the *customer* asks. There is no judgement
+    # here for a reviewer to second-guess.
+    case, created = cases.open_case(customer_id, rep["rep_id"], f"handoff: {reason}")
+
+    if not created:
+        opening = f"You already have case #{case['case_id']} open with {rep['rep_name']}"
+        closing = "They have your history and will pick this up."
+    else:
+        opening = (
+            "Of course" if explicit
+            else "I'm not finding what you need, and I don't want to keep you going in circles"
+        )
+        opening += (
+            f" - I've opened case #{case['case_id']} with {rep['rep_name']}, "
+            f"{rep['rep_title'].lower()} for your account"
+        )
+        closing = (
+            f"They'll see this whole conversation and usually reply within one "
+            f"business day. If it's urgent, reach them directly at {rep['rep_email']}."
+        )
+
+    return {"messages": [AIMessage(f"{opening}. {closing}")], "jump_to": "end"}
 
 
 @after_model

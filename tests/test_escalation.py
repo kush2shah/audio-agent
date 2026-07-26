@@ -106,3 +106,38 @@ def test_rejecting_writes_nothing():
         context=Ctx(customer_id=CUSTOMER),
     )
     assert cases.open_cases_for(CUSTOMER) == [], "a rejected write must not happen"
+
+
+def test_handoff_writes_a_case_so_the_promise_is_true():
+    """The handoff message names a rep and a case number. Both must be real.
+
+    An earlier version told the customer "they'll have this conversation in
+    front of them" and wrote nothing at all.
+    """
+    from langchain.messages import HumanMessage
+
+    from chinook_support.middleware import handoff_to_human
+
+    class _Runtime:
+        context = Ctx(customer_id=CUSTOMER)
+
+    result = handoff_to_human.after_model(
+        {"messages": [HumanMessage("I want to speak to a human")]}, _Runtime()
+    )
+    assert result and result.get("jump_to") == "end"
+
+    open_cases = cases.open_cases_for(CUSTOMER)
+    assert len(open_cases) == 1, "the handoff promised follow-up, so it must record one"
+    assert f"#{open_cases[0]['case_id']}" in result["messages"][0].content
+
+
+@pytest.mark.parametrize("customer_id", [1, 35, 58])
+def test_the_prompt_carries_the_real_rep_details(customer_id):
+    """The model invented a support email when asked for contact details it had
+    never been given. It now gets them every turn, per customer."""
+    from chinook_support.middleware import prompt_with_rep
+
+    prompt = prompt_with_rep("base", customer_id)
+    rep = queries.support_rep_for(customer_id)
+    assert rep["rep_email"] in prompt
+    assert rep["rep_name"] in prompt
