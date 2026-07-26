@@ -17,6 +17,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
+from . import queries
 from .context import Ctx
 from .middleware import handoff_to_human, receipts, with_assigned_rep
 from .tools.account import get_my_invoice, list_my_invoices
@@ -115,6 +116,11 @@ def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHE
     # after you learn v1 was wrong.
     return agent.with_config(metadata={"contract_version": contract_version})
 
+
+# Reference data is read once here, at import, rather than lazily on the first
+# request - a lazy first read lands inside a middleware hook, and a blocking
+# SQLite call on the event loop is rejected by the LangGraph server.
+queries.warm_caches()
 
 # Exported for langgraph.json. checkpointer=None because the LangGraph server
 # provides persistence itself and rejects a graph that brings its own.

@@ -11,11 +11,13 @@ run itself, so LangSmith can be queried by business rule rather than only by
 latency and tokens.
 """
 
+import asyncio
 import json
 import re
 from typing import Any
 
 from langchain.agents.middleware import (
+    AgentMiddleware,
     AgentState,
     ModelRequest,
     after_model,
@@ -129,9 +131,7 @@ def with_assigned_rep(request: ModelRequest) -> str:
     return prompt_with_rep(request.system_prompt or "", request.runtime.context.customer_id)
 
 
-@after_model
-@hook_config(can_jump_to=["end"])
-def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
+def _handoff(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
     """Stop the loop and route to the customer's own support rep.
 
     Fires when the customer asks for a person, or when the agent has hit several
@@ -194,6 +194,33 @@ def handoff_to_human(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any]
         )
 
     return {"messages": [AIMessage(f"{opening}. {closing}")], "jump_to": "end"}
+
+
+class HandoffToHuman(AgentMiddleware):
+    """Wraps `_handoff` with both a sync and an async hook.
+
+    Middleware hooks run directly in the event loop - unlike tools, which
+    LangGraph runs in a threadpool - so a synchronous SQLite write here blocks
+    the whole server. The LangGraph dev server rejects it outright:
+
+        BlockingError: Blocking call to sqlite3.Connection.execute
+
+    Defining only the async hook is not an option either: sync `.invoke()` then
+    fails with "Synchronous implementation of ... is not available", which would
+    break every test and script. So both exist, and the async one moves the write
+    off the loop.
+    """
+
+    @hook_config(can_jump_to=["end"])
+    def after_model(self, state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
+        return _handoff(state, runtime)
+
+    @hook_config(can_jump_to=["end"])
+    async def aafter_model(self, state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
+        return await asyncio.to_thread(_handoff, state, runtime)
+
+
+handoff_to_human = HandoffToHuman()
 
 
 @after_model

@@ -14,6 +14,8 @@ Keeping this layer separate buys three things:
 Every customer-scoped query carries `AND CustomerId = ?`. That is the boundary.
 """
 
+from functools import lru_cache
+
 from .db import query, query_one
 
 # --- Account ---------------------------------------------------------------
@@ -83,6 +85,37 @@ def owned_track_ids(customer_id: int) -> set[int]:
     return {r["track_id"] for r in rows}
 
 
+@lru_cache(maxsize=1)
+def _support_reps() -> dict[int, dict]:
+    """Every customer's rep, loaded once.
+
+    Rep assignments are reference data - 59 rows that don't change while the
+    process runs. Queried per-turn from middleware they'd be a blocking SQLite
+    call inside the async event loop, which the LangGraph server rejects
+    outright. Reading them once at first use is both faster and correct.
+    """
+    rows = query(
+        """SELECT c.CustomerId AS customer_id,
+                  e.EmployeeId AS rep_id,
+                  e.FirstName || ' ' || e.LastName AS rep_name,
+                  e.Title AS rep_title,
+                  e.Email AS rep_email
+           FROM Customer c
+           JOIN Employee e ON e.EmployeeId = c.SupportRepId"""
+    )
+    return {row.pop("customer_id"): row for row in rows}
+
+
+def warm_caches() -> None:
+    """Load reference data now, so no request path ever triggers the first read.
+
+    `lru_cache` alone isn't enough: the first call still hits SQLite, and if that
+    happens inside a middleware hook it's a blocking call on the event loop,
+    which the LangGraph server refuses. Called at import time in agent.py.
+    """
+    _support_reps()
+
+
 def support_rep_for(customer_id: int) -> dict | None:
     """The employee already assigned to this customer in Chinook.
 
@@ -90,16 +123,7 @@ def support_rep_for(customer_id: int) -> dict | None:
     which is the difference between "someone will get back to you" and "Jane, who
     has handled your account since 2021, will."
     """
-    return query_one(
-        """SELECT e.EmployeeId AS rep_id,
-                  e.FirstName || ' ' || e.LastName AS rep_name,
-                  e.Title AS rep_title,
-                  e.Email AS rep_email
-           FROM Customer c
-           JOIN Employee e ON e.EmployeeId = c.SupportRepId
-           WHERE c.CustomerId = ?""",
-        (customer_id,),
-    )
+    return _support_reps().get(customer_id)
 
 
 # --- Catalog ---------------------------------------------------------------
