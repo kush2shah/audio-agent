@@ -25,6 +25,10 @@ from .tools.support import escalate_to_human
 
 MODEL = os.getenv("CHINOOK_MODEL", "anthropic:claude-sonnet-4-6")
 
+# Sentinel: "you didn't say, so bring your own checkpointer". Distinct from an
+# explicit None, which means "the platform is providing persistence".
+_OWN_CHECKPOINTER = object()
+
 SYSTEM_PROMPT = """You are the customer support assistant for Chinook Records, an \
 online music store.
 
@@ -51,7 +55,7 @@ same thing twice without success, or when they need something you have no tool \
 for. Opening a case is a normal, good outcome - not a failure."""
 
 
-def build_agent(contract_version: str = "v2"):
+def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHECKPOINTER):
     """Build the agent against one version of the recommendation contract.
 
     v1 and v2 differ only in the SQL behind `recommend_tracks`. Same model, same
@@ -86,9 +90,16 @@ def build_agent(contract_version: str = "v2"):
             handoff_to_human,
             receipts,
         ],
-        # Interrupts need somewhere to keep the conversation while it waits.
-        # InMemorySaver is fine for a demo; production wants Postgres.
-        checkpointer=InMemorySaver(),
+        # Interrupts need somewhere to keep the conversation while it waits, but
+        # who provides that depends on how the agent is being run:
+        #
+        #   direct invoke()      we must supply one, or interrupts can't pause
+        #   langgraph dev/API    the platform supplies it, and passing our own
+        #                        is a hard startup error
+        #
+        # So the module-level graphs below pass None, and everything else gets
+        # an InMemorySaver. Fine for a demo; production wants Postgres.
+        checkpointer=InMemorySaver() if checkpointer is _OWN_CHECKPOINTER else checkpointer,
     )
     # Stamped on the root run at invoke time, so `contract_version` is filterable
     # across whole traces - which is how you find every v1 run in production
@@ -96,6 +107,8 @@ def build_agent(contract_version: str = "v2"):
     return agent.with_config(metadata={"contract_version": contract_version})
 
 
-graph_v1 = build_agent("v1")  # ships the recommendation bug, kept for the demo
-graph_v2 = build_agent("v2")  # the fix
+# Exported for langgraph.json. checkpointer=None because the LangGraph server
+# provides persistence itself and rejects a graph that brings its own.
+graph_v1 = build_agent("v1", checkpointer=None)  # ships the bug, kept for the demo
+graph_v2 = build_agent("v2", checkpointer=None)  # the fix
 graph = graph_v2
