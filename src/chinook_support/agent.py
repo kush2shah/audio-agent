@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from . import queries
 from .context import Ctx
-from .middleware import handoff_to_human, receipts, with_assigned_rep
+from .middleware import handoff_score, handoff_to_human, receipts, with_assigned_rep
 from .tools.account import get_my_invoice, list_my_invoices
 from .tools.catalog import make_recommend_tracks, search_catalog
 from .tools.support import escalate_to_human
@@ -110,6 +110,8 @@ def build_agent(
             # after the model, so both see the completed tool results for the turn.
             handoff_to_human,
             receipts,
+            # Scores every turn 0/1 so the monitoring page can chart handoff rate.
+            handoff_score,
         ],
         # Interrupts need somewhere to keep the conversation while it waits, but
         # who provides that depends on how the agent is being run:

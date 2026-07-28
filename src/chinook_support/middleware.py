@@ -26,7 +26,7 @@ from langchain.agents.middleware import (
 )
 from langchain.messages import AIMessage, ToolMessage
 from langgraph.runtime import Runtime
-from langsmith import get_current_run_tree
+from langsmith import Client, get_current_run_tree
 
 from . import cases, queries
 from .context import Ctx
@@ -259,6 +259,27 @@ def _handoff(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
     }
 
 
+class HandoffScore(AgentMiddleware):
+    """Emits the handoff feedback once per conversation turn.
+
+    Lives in after_agent rather than after_model so it fires once, not once per
+    model call, and so it sees the handoff message if one was added. Sync and
+    async variants because the feedback call is network IO and middleware runs on
+    the event loop.
+    """
+
+    def after_agent(self, state: AgentState, runtime: Runtime[Ctx]) -> None:
+        _score_handoff(state)
+        return None
+
+    async def aafter_agent(self, state: AgentState, runtime: Runtime[Ctx]) -> None:
+        await asyncio.to_thread(_score_handoff, state)
+        return None
+
+
+handoff_score = HandoffScore()
+
+
 class HandoffToHuman(AgentMiddleware):
     """Wraps `_handoff` with both a sync and an async hook.
 
@@ -284,6 +305,33 @@ class HandoffToHuman(AgentMiddleware):
 
 
 handoff_to_human = HandoffToHuman()
+
+
+def _score_handoff(state: AgentState) -> None:
+    """Record whether this conversation ended with a human, as run feedback.
+
+    Feedback, not metadata, and the difference matters. Metadata written from a
+    hook lands on the hook's own span - see _receipt_target. Feedback can be
+    attached to the *root* run by id, which is the only thing that reaches the
+    trace itself from in here.
+
+    It's also the right primitive: LangSmith charts the mean of a feedback key,
+    so scoring every run 0 or 1 turns "handoff rate" into a line on the
+    monitoring page rather than a number you have to compute from two queries.
+    Only scoring the handoffs would give a count with no denominator.
+    """
+    run = get_current_run_tree()
+    if run is None:
+        return
+    handed_off = _already_handed_off(state)
+    try:
+        Client().create_feedback(
+            run_id=run.trace_id,
+            key="handoff",
+            score=1 if handed_off else 0,
+        )
+    except Exception:  # observability must never break the conversation
+        pass
 
 
 @after_model
