@@ -7,6 +7,8 @@ data/chinook.db
 data/support_cases.db
 .langgraph_api/
 
-# Docs stay local - not part of the committed deliverable
+# Docs stay local - not part of the committed deliverable.
+# README is the exception: it's the repo's front door.
 *.md
+!README.md
 plans/
