@@ -99,15 +99,16 @@ def recommendation_audit(customer_id: int) -> dict:
     """Check whether our recommender has been suggesting things they already own.
 
     Replays the recommendation each of this customer's orders would have produced
-    and counts how many suggestions were tracks they'd already bought. A customer
-    repeatedly told to buy what they own has a concrete reason to disengage.
+    and counts how many suggestions were tracks they'd already bought *at that
+    point in time*. A customer repeatedly told to buy what they own has a
+    concrete reason to disengage.
 
     Args:
         customer_id: The customer on the case.
     """
-    owned = queries.owned_track_ids(customer_id)
     invoices = query(
-        "SELECT InvoiceId AS invoice_id FROM Invoice WHERE CustomerId = ? ORDER BY InvoiceDate",
+        """SELECT InvoiceId AS invoice_id, DATE(InvoiceDate) AS date
+           FROM Invoice WHERE CustomerId = ? ORDER BY InvoiceDate""",
         (customer_id,),
     )
 
@@ -116,11 +117,30 @@ def recommendation_audit(customer_id: int) -> dict:
         seed = queries.invoice_seed_profile(row["invoice_id"])
         if not seed["artist_ids"]:
             continue
+
+        # Ownership *as of that order*, not today. Using today's library would
+        # accuse the recommender of repeating a purchase the customer hadn't made
+        # yet - across this dataset that inflates the count by about 3%, and it
+        # would have the investigator telling a rep something demonstrably false.
+        owned_then = {
+            r["track_id"]
+            for r in query(
+                """SELECT DISTINCT il.TrackId AS track_id
+                   FROM Invoice i JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+                   WHERE i.CustomerId = ? AND DATE(i.InvoiceDate) <= ?""",
+                (customer_id, row["date"]),
+            )
+        }
+
         suggested = queries.recommend(customer_id, seed, None, None, 5, exclude_owned=False)
-        repeats = [s["track"] for s in suggested if s["track_id"] in owned]
+        repeats = [s["track"] for s in suggested if s["track_id"] in owned_then]
         if repeats:
             findings.append(
-                {"seed_invoice": row["invoice_id"], "already_owned_suggested": repeats}
+                {
+                    "seed_invoice": row["invoice_id"],
+                    "order_date": row["date"],
+                    "already_owned_suggested": repeats,
+                }
             )
 
     total = sum(len(f["already_owned_suggested"]) for f in findings)

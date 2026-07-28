@@ -24,7 +24,7 @@ from langchain.agents.middleware import (
     dynamic_prompt,
     hook_config,
 )
-from langchain.messages import AIMessage
+from langchain.messages import AIMessage, ToolMessage
 from langgraph.runtime import Runtime
 from langsmith import get_current_run_tree
 
@@ -60,18 +60,28 @@ HUMAN_REQUESTED = re.compile(
 )
 
 
-def _root_run():
-    """The trace's root run, walking up from wherever we're called.
+def _receipt_target():
+    """Where a receipt can actually be written from inside a hook.
 
-    `get_current_run_tree()` inside a middleware hook returns that hook's own
-    span (`receipts.after_model`). Metadata written there is real but useless -
-    LangSmith's run filters match against root runs, so a receipt on a nested
-    span can't be queried. Walk to the top.
+    Not the trace root, despite two attempts to make it so:
+
+      - `get_current_run_tree()` returns the *hook's own span*, e.g.
+        `HandoffToHuman.after_model`.
+      - Walking up via `parent_run` doesn't work: on a reconstructed tree that
+        attribute is None. Only `parent_run_id` and `trace_id` are populated,
+        and neither gives you the object.
+      - Patching the root afterwards with `client.update_run(trace_id, ...)`
+        returns 409 Conflict once the run has completed.
+
+    So receipts live on the middleware span. They are still filterable -
+    `eq(metadata_key, "handoff_reason")` finds them - but the matches are spans,
+    not root runs, and anything reading `run.extra["metadata"]` off a root run
+    will find nothing. See scripts/audit_handoffs.py, which had exactly that bug.
+
+    Anything knowable before the run starts belongs on the root instead, set via
+    `agent.with_config(metadata=...)` - that's how `contract_version` gets there.
     """
-    run = get_current_run_tree()
-    while run is not None and getattr(run, "parent_run", None) is not None:
-        run = run.parent_run
-    return run
+    return get_current_run_tree()
 
 
 def _tool_payloads(state: AgentState) -> list[dict]:
@@ -95,6 +105,45 @@ def _consecutive_dead_ends(payloads: list[dict]) -> int:
         else:
             break
     return count
+
+
+HANDOFF_MARKER = "⁠"  # zero-width, invisible to the customer
+
+
+def _already_handed_off(state: AgentState) -> bool:
+    """Did we already hand this conversation over?
+
+    Marked with a zero-width character rather than by matching the text, so
+    rewording the handoff message can't silently break the check.
+    """
+    for message in state["messages"]:
+        if getattr(message, "type", None) == "ai" and HANDOFF_MARKER in str(message.content):
+            return True
+    return False
+
+
+def _settle_pending_tool_calls(state: AgentState) -> list:
+    """Close out any tool call the model proposed but that will now never run.
+
+    Ending the turn from `after_model` skips the tools node, which leaves an
+    AIMessage holding a tool_call with no matching ToolMessage. Anthropic rejects
+    that history on the *next* request:
+
+        tool_use ids were found without tool_result blocks
+
+    So the turn appears to succeed and the conversation is bricked from then on.
+    Every pending call needs an answer before we jump.
+    """
+    last = state["messages"][-1] if state["messages"] else None
+    pending = getattr(last, "tool_calls", None) or []
+    return [
+        ToolMessage(
+            content="Not run - this conversation was handed to a human colleague.",
+            tool_call_id=call["id"],
+            name=call["name"],
+        )
+        for call in pending
+    ]
 
 
 def _asked_for_a_human(state: AgentState) -> bool:
@@ -148,20 +197,28 @@ def _handoff(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
     if not explicit and dead_ends < CONSECUTIVE_DEAD_ENDS_BEFORE_HANDOFF:
         return None
 
+    # Already handed off on this conversation - don't do it again every turn.
+    # The dead-end streak is computed over the whole history, so without this the
+    # customer gets handed off on every subsequent message.
+    if _already_handed_off(state):
+        return None
+
     customer_id = runtime.context.customer_id
     rep = queries.support_rep_for(customer_id)
     reason = "customer_requested" if explicit else "repeated_dead_ends"
 
-    if run := _root_run():
+    if run := _receipt_target():
         run.add_metadata({"handoff": True, "handoff_reason": reason})
 
     if rep is None:  # no rep on file - still stop, don't keep looping
         return {
             "messages": [
+                *_settle_pending_tool_calls(state),
                 AIMessage(
                     "I'm not able to sort this out here, so I'm passing you to our "
                     "support team - someone will follow up with you directly."
-                )
+                    + HANDOFF_MARKER
+                ),
             ],
             "jump_to": "end",
         }
@@ -193,7 +250,13 @@ def _handoff(state: AgentState, runtime: Runtime[Ctx]) -> dict[str, Any] | None:
             f"business day. If it's urgent, reach them directly at {rep['rep_email']}."
         )
 
-    return {"messages": [AIMessage(f"{opening}. {closing}")], "jump_to": "end"}
+    return {
+        "messages": [
+            *_settle_pending_tool_calls(state),
+            AIMessage(f"{opening}. {closing}{HANDOFF_MARKER}"),
+        ],
+        "jump_to": "end",
+    }
 
 
 class HandoffToHuman(AgentMiddleware):
@@ -242,7 +305,7 @@ def receipts(state: AgentState, runtime: Runtime[Ctx]) -> None:
     Same field the evaluators assert against, so "did the filter run?" is one
     fact with three consumers: model-readable, human-filterable, machine-assertable.
     """
-    run = _root_run()
+    run = _receipt_target()
     if run is None:
         return None
 

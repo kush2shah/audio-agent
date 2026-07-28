@@ -17,9 +17,28 @@ from chinook_support.middleware import HUMAN_REQUESTED
 PROJECT = "chinook-support"
 
 
+def handoff_traces(client: Client) -> set:
+    """Trace ids where a handoff actually fired.
+
+    The handoff receipt is written from inside a middleware hook, which means it
+    lands on that hook's *span*, not on the root run - `parent_run` is None on a
+    reconstructed tree, so there's no walking up, and patching the root
+    afterwards 409s.
+
+    An earlier version of this script read `handoff` off the root run's metadata,
+    where it never appears. It reported every handoff as a miss, and looked
+    exactly the same as a genuinely broken handoff. Query the spans instead.
+    """
+    spans = client.list_runs(
+        project_name=PROJECT, filter='eq(metadata_key, "handoff_reason")', limit=100
+    )
+    return {span.trace_id for span in spans}
+
+
 def main() -> None:
     client = Client()
     runs = list(client.list_runs(project_name=PROJECT, is_root=True, limit=100))
+    handed_off_traces = handoff_traces(client)
 
     misses, hits = [], 0
     for run in runs:
@@ -31,8 +50,7 @@ def main() -> None:
         )
         if not asked:
             continue
-        handed_off = bool((run.extra.get("metadata") or {}).get("handoff"))
-        if handed_off:
+        if run.trace_id in handed_off_traces:
             hits += 1
         else:
             text = next(
