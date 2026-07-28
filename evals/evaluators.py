@@ -25,8 +25,20 @@ def no_recommended_track_is_owned(outputs: dict, reference_outputs: dict) -> dic
     customer_id = outputs["customer_id"]
     recommended = set(outputs.get("recommended_track_ids") or [])
     if not recommended:
-        return {"key": "no_recommended_track_is_owned", "score": 1,
-                "comment": "no recommendations made"}
+        # Deliberately not a pass. An agent that recommends nothing satisfies
+        # "never recommend something they own" trivially, so scoring this 1 lets
+        # a broken agent look perfect. Only the cases the dataset marks as
+        # legitimately empty get a pass.
+        legitimately_empty = reference_outputs.get("empty_ok") or reference_outputs.get(
+            "foreign_seed"
+        )
+        return {
+            "key": "no_recommended_track_is_owned",
+            "score": 1 if legitimately_empty else 0,
+            "comment": "correctly returned nothing"
+            if legitimately_empty
+            else "no recommendations made at all - nothing to be right about",
+        }
 
     owned = {
         row["track_id"]
@@ -51,6 +63,31 @@ def no_recommended_track_is_owned(outputs: dict, reference_outputs: dict) -> dic
         "key": "no_recommended_track_is_owned",
         "score": 0,
         "comment": f"recommended {len(leaked)} track(s) this customer already bought: {listed}",
+    }
+
+
+def the_expected_tool_actually_ran(outputs: dict, reference_outputs: dict) -> dict:
+    """Guards every other recommendation evaluator against a vacuous pass.
+
+    Most of them check a property of the recommendations. An agent that makes no
+    recommendations satisfies all of those properties for free, so without this
+    an agent that simply refused everything would score a clean sweep.
+    """
+    made = bool(outputs.get("recommended_track_ids"))
+    statuses = outputs.get("tool_statuses") or []
+    if reference_outputs.get("foreign_seed"):
+        ok = "not_available" in statuses
+        return {"key": "the_expected_tool_actually_ran", "score": int(ok),
+                "comment": "refused a foreign seed" if ok
+                else f"expected not_available, saw {statuses}"}
+    if reference_outputs.get("empty_ok"):
+        return {"key": "the_expected_tool_actually_ran", "score": 1,
+                "comment": "empty result is acceptable here"}
+    return {
+        "key": "the_expected_tool_actually_ran",
+        "score": int(made),
+        "comment": f"{len(outputs.get('recommended_track_ids') or [])} recommendation(s)"
+        if made else f"no recommendations produced; tool statuses were {statuses}",
     }
 
 
@@ -135,15 +172,23 @@ def handed_off_when_asked(outputs: dict, reference_outputs: dict) -> dict:
     reported success with no error at all.
     """
     expected = bool(reference_outputs.get("should_hand_off"))
-    actual = bool(outputs.get("handed_off"))
+
+    # A case in the database, not an intention to open one. An earlier version
+    # scored this on whether the model *called* escalate_to_human, which counts a
+    # paused or rejected escalation as a success - a customer promised help who
+    # got none. That is precisely the failure this dataset exists to catch, so
+    # scoring it that way made the evaluator complicit in it.
+    actual = bool(outputs.get("case_opened"))
+
     if expected == actual:
         return {"key": "handed_off_when_asked", "score": 1,
-                "comment": "handed off" if actual else "correctly kept helping"}
+                "comment": "a case exists for this customer" if actual
+                else "correctly kept helping, no case opened"}
     return {
         "key": "handed_off_when_asked",
         "score": 0,
-        "comment": "customer asked for a person and nobody came"
-        if expected else "handed off when the customer just wanted help",
+        "comment": "customer asked for a person and no case was opened"
+        if expected else "opened a case when the customer just wanted help",
     }
 
 

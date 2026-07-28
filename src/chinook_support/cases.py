@@ -55,12 +55,16 @@ def open_case(customer_id: int, rep_id: int, reason: str) -> tuple[dict, bool]:
                 "SELECT * FROM support_case WHERE case_id = ?", (cursor.lastrowid,)
             ).fetchone()
             return dict(row), True
-        except sqlite3.IntegrityError:
-            # The unique index rejected it - they already have an open case.
+        except sqlite3.IntegrityError as exc:
+            # Only the "one open case per customer" index may be swallowed. Any
+            # other constraint failure is a real bug, and turning it into a
+            # cheerful "you already have a case" would hide it.
             row = con.execute(
                 "SELECT * FROM support_case WHERE customer_id = ? AND status = 'open'",
                 (customer_id,),
             ).fetchone()
+            if row is None:
+                raise
             return dict(row), False
 
 

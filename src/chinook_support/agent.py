@@ -12,6 +12,7 @@ governs tone and how to talk about tool results.
 """
 
 import os
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
@@ -62,7 +63,11 @@ they don't need help. Give them their rep's email so they aren't left with \
 nothing."""
 
 
-def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHECKPOINTER):
+def build_agent(
+    contract_version: Literal["v1", "v2"] = "v2",
+    *,
+    checkpointer: object = _OWN_CHECKPOINTER,
+):
     """Build the agent against one version of the recommendation contract.
 
     v1 and v2 differ only in the SQL behind `recommend_tracks`. Same model, same
@@ -71,6 +76,12 @@ def build_agent(contract_version: str = "v2", *, checkpointer: object = _OWN_CHE
     no restart is needed mid-demo, and an experiment can't accidentally pick up
     the wrong one.
     """
+    # Fail closed. Previously any string that wasn't exactly "v2" - "V2", "v3", a
+    # typo - silently selected the broken contract, which is the worst possible
+    # direction for a mistake to go.
+    if contract_version not in ("v1", "v2"):
+        raise ValueError(f"contract_version must be 'v1' or 'v2', got {contract_version!r}")
+
     agent = create_agent(
         model=MODEL,
         tools=[

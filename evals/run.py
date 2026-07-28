@@ -22,12 +22,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from langsmith import Client, evaluate  # noqa: E402
 
+from chinook_support import cases  # noqa: E402
 from chinook_support.agent import build_agent  # noqa: E402
 from chinook_support.context import Ctx  # noqa: E402
 import evaluators as ev  # noqa: E402
 
+# handoff examples share one sidecar database and reset it, so they must not run
+# in parallel. The others are read-only against Chinook and can.
+CONCURRENCY = {"handoff-intent": 1}
+
 DATASETS = {
     "recommendation-invariants": [
+        ev.the_expected_tool_actually_ran,
         ev.no_recommended_track_is_owned,
         ev.recommendations_exist_in_catalog,
         ev.tool_calls_correctly_scoped,
@@ -58,6 +64,10 @@ def make_target(version: str):
 
     def target(inputs: dict) -> dict:
         customer_id = inputs["customer_id"]
+        # Cases persist across examples, and "you already have case #1 open" is a
+        # different outcome from opening one. Clear first so each example is
+        # measured on its own. Requires serial execution - see CONCURRENCY.
+        cases.reset()
         result = agent.invoke(
             {"messages": [{"role": "user", "content": inputs["question"]}]},
             config={"configurable": {"thread_id": str(uuid.uuid4())}},
@@ -87,9 +97,12 @@ def make_target(version: str):
                     invoice_ids.append(row["invoice_id"])
 
         answer = _text(result["messages"][-1])
-        # The deterministic handoff ends the turn itself, so a handoff shows up
-        # either as the escalation tool being called or as that closing message.
-        handed_off = called_escalate or "case #" in answer.lower()
+
+        # Ask the database, not the transcript. Whether a case exists is the only
+        # thing the customer actually gets; "the model called the tool" and "the
+        # reply said case #" are both satisfied by escalations that never
+        # completed.
+        case_opened = bool(cases.open_cases_for(customer_id))
 
         return {
             "customer_id": customer_id,
@@ -97,7 +110,8 @@ def make_target(version: str):
             "recommended_track_ids": track_ids,
             "invoice_ids_returned": invoice_ids,
             "tool_statuses": statuses,
-            "handed_off": handed_off,
+            "case_opened": case_opened,
+            "model_proposed_escalation": called_escalate,
         }
 
     return target
@@ -118,7 +132,7 @@ def main() -> None:
                 evaluators=DATASETS[name],
                 experiment_prefix=f"{name}-{version}",
                 metadata={"contract_version": version},
-                max_concurrency=4,
+                max_concurrency=CONCURRENCY.get(name, 4),
                 client=client,
             )
 

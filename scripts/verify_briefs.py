@@ -64,13 +64,21 @@ def check(brief: str, customer_id: int) -> list[tuple[bool, str]]:
     facts = facts_for(customer_id)
     results = []
 
-    if m := re.search(r"(\d+)\s+orders", brief, re.I):
+    for m in re.finditer(r"(\d+)\s+orders\b", brief, re.I):
         claimed = int(m.group(1))
         results.append((claimed == facts["orders"],
                         f"orders: claimed {claimed}, actual {facts['orders']}"))
 
-    if m := re.search(r"\$\s?([\d,]+\.\d{2})", brief):
-        claimed = float(m.group(1).replace(",", ""))
+    # Only figures the brief labels as lifetime/total spend. Matching the first
+    # currency value in the document instead flagged average-order figures as
+    # wrong lifetime totals - a checker that cries wolf gets ignored just as fast
+    # as one that rubber-stamps.
+    for m in re.finditer(
+        r"(?:lifetime|total)[^\n$]{0,30}\$\s?([\d,]+\.\d{2})"
+        r"|\$\s?([\d,]+\.\d{2})[^\n.]{0,20}(?:lifetime|total spend)",
+        brief, re.I,
+    ):
+        claimed = float((m.group(1) or m.group(2)).replace(",", ""))
         results.append((abs(claimed - facts["spend"]) < 0.01,
                         f"lifetime spend: claimed ${claimed}, actual ${facts['spend']}"))
 
@@ -81,9 +89,25 @@ def check(brief: str, customer_id: int) -> list[tuple[bool, str]]:
         results.append((actual == int(n),
                         f"{artist}: claimed {n} tracks, actual {actual}"))
 
-    # "they own 2 of 18 tracks"
-    for owned, total in re.findall(r"own\s+(\d+)\s+of\s+(\d+)\s+tracks", brief, re.I):
-        results.append((True, f"{DIM}(album counts claimed: {owned}/{total}){RESET}"))
+    # "own 2 of 18 tracks" - check it against the album named nearby.
+    #
+    # This used to append (True, ...) unconditionally, i.e. print a tick without
+    # checking anything, inside a script whose entire purpose is checking. Worse
+    # than not having the check, because it reported a pass.
+    for match in re.finditer(
+        r"\*([^*\n]{3,60}?)\*[^.\n]{0,120}?own[s]?\s+(\d+)\s+of\s+(\d+)\s+tracks",
+        brief, re.I,
+    ):
+        album, owned, total = match.group(1).strip(" *—-–"), int(match.group(2)), int(match.group(3))
+        counts = album_ownership(customer_id, album)
+        if counts is None:
+            results.append((False, f"'{album}': no such album in the catalog"))
+        else:
+            real_total, real_owned = counts
+            results.append((
+                (owned, total) == (real_owned, real_total),
+                f"'{album}': claimed owns {owned}/{total}, actual {real_owned}/{real_total}",
+            ))
 
     # The claim that went wrong the first time.
     for album in re.findall(r"\*([^*]+?)\*[^.]{0,80}?fully unowned", brief, re.I):
@@ -123,7 +147,11 @@ def main() -> None:
         print(f"{BOLD}{name}  (customer {customer_id}){RESET}")
         checks = check(text, customer_id)
         if not checks:
-            print(f"  {DIM}no checkable numbers found{RESET}")
+            # Not a pass. A brief with no verifiable numbers is a brief this
+            # script cannot vouch for, and saying nothing is how a checker ends
+            # up rubber-stamping.
+            failures += 1
+            print(f"  {RED}UNCHECKED{RESET} no verifiable claims found in this brief")
         for ok, detail in checks:
             failures += not ok
             print(f"  {GREEN + 'ok  ' if ok else RED + 'WRONG'}{RESET} {detail}")
