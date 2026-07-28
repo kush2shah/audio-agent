@@ -2,7 +2,8 @@
   "dependencies": ["."],
   "graphs": {
     "support": "chinook_support.agent:graph_v2",
-    "support_v1_buggy": "chinook_support.agent:graph_v1"
+    "support_v1_buggy": "chinook_support.agent:graph_v1",
+    "case_investigator": "chinook_support.investigator:graph"
   },
   "env": ".env"
 }

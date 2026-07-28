@@ -1,44 +1,50 @@
 """The back-office case investigator - a Deep Agent, deliberately off the chat path.
 
-When the support agent hands a customer to a person, it opens a case. This works
-that queue: for each open case it pulls the customer's history, works out who they
-are and what they like, and writes a brief the rep can read in thirty seconds
-before replying.
+When the support agent hands a customer to a person it opens a case. This works
+that queue, and its job is diagnosis, not summary: *why* did this person end up
+escalating?
 
-Why this is a Deep Agent and the support bot is not:
+That distinction is what makes it Deep Agent work. Summarising a customer is a
+fixed pipeline - fetch, format, done - and `create_agent()` handles it fine.
+Diagnosis branches: if they're lapsed you look at what changed before they went
+quiet; if their spend collapsed you look at what they stopped buying; if our
+recommender was feeding them things they already owned you check how far back it
+goes. What you look at second depends on what you found first, which is exactly
+what planning and a scratchpad are for.
 
-    support bot     one customer, one question, seconds, a fixed small set of
-                    tools. `create_agent()` - a model/tool loop is the whole job.
+    support bot     one customer, one question, seconds, fixed tools.
+                    create_agent() - a model/tool loop is the whole job.
 
-    investigator    an open-ended queue, many steps per case, needs to plan,
-                    accumulate findings, and write them somewhere.
-                    `create_deep_agent()` - planning and a filesystem are the job.
+    investigator    an open-ended question, branching evidence, minutes,
+                    writes findings down. create_deep_agent().
 
-The boundary is the point. A customer asking "what did I buy" must never trigger
-a planning loop, and a rep preparing for a difficult conversation shouldn't be
-limited to what fits in one turn.
+A customer asking "what did I buy" must never trigger a planning loop.
 
-Note what it does *not* do. Chinook has no chargebacks, disputes, or payment
-records - I checked, and there isn't a single customer who bought the same track
-twice. So this doesn't investigate billing errors, because there are none to
-find. It does what the data supports: prepares a brief from real purchase
-history.
+Note what this deliberately doesn't do. Chinook has no chargebacks, disputes, or
+payment records - not one customer bought the same track twice - so it doesn't
+investigate billing errors, because there are none. It investigates what the data
+can actually answer.
 
 The tools here are staff-facing and take an explicit customer_id, unlike the
 customer-facing tools where identity is injected and unforgeable. Different
-principal, different contract - a rep is *supposed* to be able to look up the
-customer whose case they're working.
+principal, different contract: a rep is *supposed* to be able to look up the
+customer whose case they're working. That also means this agent must never be
+reachable by customer traffic - a deployment boundary, not a code one.
 """
 
 from langchain.tools import tool
 
-from . import cases
+from . import cases, queries
 from .db import query
+
+# The dataset's "today". Chinook's last invoice is 2025-12-22, so real-world now
+# would make every customer look lapsed.
+TODAY = "2025-12-22"
 
 
 @tool
-def list_open_cases() -> list[dict]:
-    """List support cases waiting for a rep."""
+def open_cases() -> list[dict]:
+    """Support cases waiting for a rep, oldest first."""
     with cases._connect() as con:
         rows = con.execute(
             "SELECT case_id, customer_id, rep_id, reason, opened_at "
@@ -48,109 +54,145 @@ def list_open_cases() -> list[dict]:
 
 
 @tool
-def customer_profile(customer_id: int) -> dict:
-    """Who this customer is: how long, how much, and what they listen to.
+def purchase_timeline(customer_id: int) -> dict:
+    """Order history over time: is this customer growing, shrinking, or gone?
 
-    Args:
-        customer_id: The customer on the case being worked.
-    """
-    totals = query(
-        """SELECT COUNT(*) AS orders,
-                  ROUND(SUM(Total), 2) AS lifetime_spend,
-                  MIN(DATE(InvoiceDate)) AS first_order,
-                  MAX(DATE(InvoiceDate)) AS last_order
-           FROM Invoice WHERE CustomerId = ?""",
-        (customer_id,),
-    )
-    genres = query(
-        """SELECT g.Name AS genre, COUNT(*) AS tracks
-           FROM Invoice i
-           JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-           JOIN Track t ON t.TrackId = il.TrackId
-           LEFT JOIN Genre g ON g.GenreId = t.GenreId
-           WHERE i.CustomerId = ?
-           GROUP BY g.Name ORDER BY tracks DESC LIMIT 5""",
-        (customer_id,),
-    )
-    artists = query(
-        """SELECT ar.Name AS artist, COUNT(*) AS tracks
-           FROM Invoice i
-           JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-           JOIN Track t ON t.TrackId = il.TrackId
-           JOIN Album al ON al.AlbumId = t.AlbumId
-           JOIN Artist ar ON ar.ArtistId = al.ArtistId
-           WHERE i.CustomerId = ?
-           GROUP BY ar.Name ORDER BY tracks DESC LIMIT 5""",
-        (customer_id,),
-    )
-    return {**(totals[0] if totals else {}), "top_genres": genres, "top_artists": artists}
-
-
-@tool
-def order_history(customer_id: int, limit: int = 10) -> list[dict]:
-    """This customer's orders, newest first.
+    Reports every order, how long they've been quiet, and whether their recent
+    spend is below their early spend. Use it to decide whether this is a lapsed
+    customer, a declining one, or someone who was fine until something specific
+    happened.
 
     Args:
         customer_id: The customer on the case.
-        limit: How many orders to return.
     """
-    return query(
-        """SELECT i.InvoiceId AS invoice_id, DATE(i.InvoiceDate) AS date,
-                  i.Total AS total, COUNT(il.InvoiceLineId) AS items
-           FROM Invoice i JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-           WHERE i.CustomerId = ?
-           GROUP BY i.InvoiceId ORDER BY i.InvoiceDate DESC LIMIT ?""",
-        (customer_id, limit),
+    orders = query(
+        """SELECT InvoiceId AS invoice_id, DATE(InvoiceDate) AS date, Total AS total
+           FROM Invoice WHERE CustomerId = ? ORDER BY InvoiceDate""",
+        (customer_id,),
     )
+    if not orders:
+        return {"orders": [], "note": "no purchase history"}
+
+    half = len(orders) // 2 or 1
+    early = sum(o["total"] for o in orders[:half]) / half
+    late_orders = orders[half:] or orders[-1:]
+    late = sum(o["total"] for o in late_orders) / len(late_orders)
+    quiet = query(
+        "SELECT CAST(julianday(?) - julianday(MAX(InvoiceDate)) AS INT) AS days "
+        "FROM Invoice WHERE CustomerId = ?",
+        (TODAY, customer_id),
+    )[0]["days"]
+
+    return {
+        "orders": orders,
+        "order_count": len(orders),
+        "days_since_last_order": quiet,
+        "avg_order_early": round(early, 2),
+        "avg_order_recent": round(late, 2),
+        "spend_direction": "declining" if late < early * 0.8
+        else "growing" if late > early * 1.2 else "steady",
+    }
 
 
 @tool
-def unsold_catalog_for_artist(artist_name: str, customer_id: int) -> list[dict]:
-    """Albums we stock by an artist, with how much of each this customer owns.
+def recommendation_audit(customer_id: int) -> dict:
+    """Check whether our recommender has been suggesting things they already own.
 
-    Reports per album: total tracks, how many they already have, how many are
-    new. Returning bare unowned tracks was not enough - the agent read a list of
-    unowned tracks and wrote "this album is fully unowned" about a record the
-    customer already had one track from. The tool was right and the summary
-    wasn't, so the tool now carries the fact the summary needs.
+    Replays the recommendation each of this customer's orders would have produced
+    and counts how many suggestions were tracks they'd already bought. A customer
+    repeatedly told to buy what they own has a concrete reason to disengage.
 
     Args:
-        artist_name: Artist to check.
-        customer_id: Customer whose purchases to account for.
+        customer_id: The customer on the case.
+    """
+    owned = queries.owned_track_ids(customer_id)
+    invoices = query(
+        "SELECT InvoiceId AS invoice_id FROM Invoice WHERE CustomerId = ? ORDER BY InvoiceDate",
+        (customer_id,),
+    )
+
+    findings = []
+    for row in invoices:
+        seed = queries.invoice_seed_profile(row["invoice_id"])
+        if not seed["artist_ids"]:
+            continue
+        suggested = queries.recommend(customer_id, seed, None, None, 5, exclude_owned=False)
+        repeats = [s["track"] for s in suggested if s["track_id"] in owned]
+        if repeats:
+            findings.append(
+                {"seed_invoice": row["invoice_id"], "already_owned_suggested": repeats}
+            )
+
+    total = sum(len(f["already_owned_suggested"]) for f in findings)
+    return {
+        "orders_checked": len(invoices),
+        "orders_with_bad_suggestions": len(findings),
+        "wasted_suggestions": total,
+        "detail": findings[:5],
+    }
+
+
+@tool
+def catalog_gaps(customer_id: int) -> list[dict]:
+    """Albums by artists this customer already likes, and how much of each they own.
+
+    Gives a rep something concrete to offer. Counts are per album - total tracks,
+    how many they own, how many are new - so nothing has to be inferred.
+
+    Args:
+        customer_id: The customer on the case.
     """
     return query(
-        """SELECT al.Title AS album,
+        """SELECT ar.Name AS artist, al.Title AS album,
                   COUNT(*) AS tracks_total,
                   SUM(CASE WHEN owned.TrackId IS NULL THEN 0 ELSE 1 END) AS tracks_owned,
                   SUM(CASE WHEN owned.TrackId IS NULL THEN 1 ELSE 0 END) AS tracks_new
            FROM Track t
            JOIN Album al ON al.AlbumId = t.AlbumId
            JOIN Artist ar ON ar.ArtistId = al.ArtistId
-           LEFT JOIN (
-               SELECT DISTINCT il.TrackId
+           LEFT JOIN (SELECT DISTINCT il.TrackId FROM Invoice i
+                      JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+                      WHERE i.CustomerId = ?) owned ON owned.TrackId = t.TrackId
+           WHERE ar.ArtistId IN (
+               SELECT ar2.ArtistId
                FROM Invoice i JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-               WHERE i.CustomerId = ?
-           ) owned ON owned.TrackId = t.TrackId
-           WHERE ar.Name = ?
+               JOIN Track t2 ON t2.TrackId = il.TrackId
+               JOIN Album al2 ON al2.AlbumId = t2.AlbumId
+               JOIN Artist ar2 ON ar2.ArtistId = al2.ArtistId
+               WHERE i.CustomerId = ?)
            GROUP BY al.AlbumId
            HAVING tracks_new > 0
            ORDER BY tracks_owned DESC, tracks_new DESC
-           LIMIT 8""",
-        (customer_id, artist_name),
+           LIMIT 10""",
+        (customer_id, customer_id),
     )
 
 
-INVESTIGATOR_PROMPT = """You prepare case briefs for Chinook Records support reps.
+INVESTIGATOR_PROMPT = f"""You investigate escalated support cases for Chinook \
+Records and write up what you find for the rep who has to reply.
 
-For each open case: look up who the customer is, what they've bought, and what \
-they listen to. Then write a brief the rep can read in thirty seconds before \
-replying.
+Your job is diagnosis, not summary. The rep can read the order history themselves. \
+What they need from you is *why this customer ended up escalating*, and what to do \
+about it.
 
-A good brief says who this customer is to us (how long, how much, what they \
-love), what the case is about, and one concrete thing the rep could offer - \
-something we stock by an artist they already like and haven't bought yet.
+Work each case like this:
 
-Save each brief to `briefs/case-<id>.md`. Be direct; reps are busy."""
+1. Look at the case, then form a hypothesis about what went wrong.
+2. Test it with the tools. Follow what you find - if they went quiet, look at what \
+changed before they went quiet; if our recommender was wasting their time, find out \
+how long that had been happening.
+3. Write findings to `briefs/case-<id>.md`.
+
+Things worth checking, though not every one matters for every case: whether they've \
+gone quiet (today's date is {TODAY}), whether their spend is falling, and whether \
+our recommender has been suggesting tracks they already owned.
+
+Every number you write must come from a tool result. If the evidence is thin, say \
+the evidence is thin - a rep acting on a confident wrong guess is worse off than one \
+told we don't know.
+
+Keep briefs short. Lead with the likely cause, then the evidence, then one concrete \
+thing the rep can offer."""
 
 
 def build_investigator():
@@ -160,6 +202,12 @@ def build_investigator():
 
     return create_deep_agent(
         model="anthropic:claude-sonnet-4-6",
-        tools=[list_open_cases, customer_profile, order_history, unsold_catalog_for_artist],
+        tools=[open_cases, purchase_timeline, recommendation_audit, catalog_gaps],
         system_prompt=INVESTIGATOR_PROMPT,
     )
+
+
+# Exported for langgraph.json so both agents can be opened side by side in
+# Studio. The argument is visual: this one plans, branches and writes files; the
+# support agent answers and stops.
+graph = build_investigator()
